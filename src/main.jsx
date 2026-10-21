@@ -50,7 +50,8 @@ function App() {
     }
     setBusy(true); setError(''); setActiveId(null);
     try {
-      const response = await fetch('/api/generate', {
+      const API_URL = import.meta.env.VITE_API_URL || '';
+      const response = await fetch(`${API_URL}/api/generate`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic, platform, audience, tone, goal })
       });
