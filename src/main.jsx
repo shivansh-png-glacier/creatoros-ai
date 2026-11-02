@@ -9,15 +9,23 @@ import {
 import './styles.css';
 
 const STORAGE_KEY = 'creatoros_campaigns_v1';
+const SEQUENCE_KEY = 'creatoros_campaign_sequence_v1';
 const starterCampaigns = [
-  { id: 'sample-1', title: 'The 30-minute design reset', platform: 'Instagram', topic: 'A practical design reset routine', createdAt: new Date(Date.now() - 86400000).toISOString(), status: 'Ready to edit', hooks: ['Your design workflow is not broken. Your first 30 minutes are.', 'Steal this 30-minute reset before your next project.'], caption: 'A small reset can make a messy creative workflow feel manageable. Save this for your next work session.', cta: 'Save this for your next project.', ideas: ['A 5-slide checklist carousel', 'A 20-second before/after reel', 'A desk setup story sequence'], thumbnail: 'Stop designing on autopilot' },
-  { id: 'sample-2', title: 'Build a portfolio that gets noticed', platform: 'YouTube', topic: 'Portfolio advice for beginner designers', createdAt: new Date(Date.now() - 3 * 86400000).toISOString(), status: 'Draft', hooks: ['Your portfolio is not a gallery. It is proof you can solve problems.', '3 portfolio mistakes keeping beginner designers invisible.'], caption: 'Show the problem, your decisions, and what changed. A pretty screen is only one part of the story.', cta: 'Comment PORTFOLIO for the checklist.', ideas: ['A 6-minute breakdown video', 'A short showing one case-study fix', 'A community poll about portfolio struggles'], thumbnail: 'Your portfolio needs THIS' }
+  { id: 'sample-1', campaignNumber: 1, title: 'The 30-minute design reset', platform: 'Instagram', topic: 'A practical design reset routine', createdAt: new Date(Date.now() - 86400000).toISOString(), status: 'Ready to edit', hooks: ['Your design workflow is not broken. Your first 30 minutes are.', 'Steal this 30-minute reset before your next project.'], caption: 'A small reset can make a messy creative workflow feel manageable. Save this for your next work session.', cta: 'Save this for your next project.', ideas: ['A 5-slide checklist carousel', 'A 20-second before/after reel', 'A desk setup story sequence'], thumbnail: 'Stop designing on autopilot' },
+  { id: 'sample-2', campaignNumber: 2, title: 'Build a portfolio that gets noticed', platform: 'YouTube', topic: 'Portfolio advice for beginner designers', createdAt: new Date(Date.now() - 3 * 86400000).toISOString(), status: 'Draft', hooks: ['Your portfolio is not a gallery. It is proof you can solve problems.', '3 portfolio mistakes keeping beginner designers invisible.'], caption: 'Show the problem, your decisions, and what changed. A pretty screen is only one part of the story.', cta: 'Comment PORTFOLIO for the checklist.', ideas: ['A 6-minute breakdown video', 'A short showing one case-study fix', 'A community poll about portfolio struggles'], thumbnail: 'Your portfolio needs THIS' }
 ];
 
 function readCampaigns() {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    return Array.isArray(stored) ? stored : starterCampaigns;
+    if (!Array.isArray(stored)) return starterCampaigns;
+    const chronological = [...stored].sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
+    return stored.map(campaign => ({
+      ...campaign,
+      campaignNumber: Number.isInteger(campaign.campaignNumber)
+        ? campaign.campaignNumber
+        : chronological.findIndex(item => item.id === campaign.id) + 1
+    }));
   } catch { return starterCampaigns; }
 }
 function App() {
@@ -34,12 +42,21 @@ function App() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [query, setQuery] = useState('');
+  const [campaignSort, setCampaignSort] = useState('newest');
   const [page, setPage] = useState('studio');
   const [mobileNav, setMobileNav] = useState(false);
 
   useEffect(() => localStorage.setItem(STORAGE_KEY, JSON.stringify(campaigns)), [campaigns]);
   const active = campaigns.find(c => c.id === activeId) || null;
-  const visibleCampaigns = useMemo(() => campaigns.filter(c => `${c.title} ${c.topic} ${c.platform}`.toLowerCase().includes(query.toLowerCase())), [campaigns, query]);
+  const visibleCampaigns = useMemo(() => {
+    const filtered = campaigns.filter(c => `${c.title} ${c.topic} ${c.platform}`.toLowerCase().includes(query.toLowerCase()));
+    return filtered.sort((a, b) => {
+      if (campaignSort === 'oldest') return new Date(a.createdAt) - new Date(b.createdAt);
+      if (campaignSort === 'title') return (a.title || '').localeCompare(b.title || '');
+      if (campaignSort === 'sequence') return (a.campaignNumber || 0) - (b.campaignNumber || 0);
+      return new Date(b.createdAt) - new Date(a.createdAt);
+    });
+  }, [campaigns, query, campaignSort]);
 
   function flash(message) {
     setNotice(message);
@@ -65,12 +82,18 @@ function App() {
         throw new Error(`Invalid server response (HTTP ${response.status}). Check the backend terminal.`);
       }
       if (!response.ok) throw new Error(data.error || data.message || 'Could not generate the campaign.');
+      const nextCampaignNumber = Math.max(
+        Number(localStorage.getItem(SEQUENCE_KEY)) || 0,
+        campaigns.reduce((highest, item) => Math.max(highest, Number(item.campaignNumber) || 0), 0)
+      ) + 1;
+      localStorage.setItem(SEQUENCE_KEY, String(nextCampaignNumber));
       const campaign = {
         ...data.campaign,
         audience,
         tone,
         goal,
         id: crypto.randomUUID(),
+        campaignNumber: nextCampaignNumber,
         createdAt: new Date().toISOString(),
         status: 'Ready to edit'
       };
@@ -412,6 +435,8 @@ function App() {
             campaigns={visibleCampaigns}
             query={query}
             setQuery={setQuery}
+            campaignSort={campaignSort}
+            setCampaignSort={setCampaignSort}
             active={active}
             setActiveId={setActiveId}
             onCopy={copyText}
@@ -462,6 +487,8 @@ function Campaigns({
   campaigns,
   query,
   setQuery,
+  campaignSort,
+  setCampaignSort,
   active,
   setActiveId,
   onCopy,
@@ -490,14 +517,55 @@ function Campaigns({
   const [imageEditPrompt, setImageEditPrompt] = useState('');
   const [headlinePosition, setHeadlinePosition] = useState({ x: 8, y: 72 });
   const [exportPreset, setExportPreset] = useState('YouTube');
+  const [settingsLoadedFor, setSettingsLoadedFor] = useState(null);
   const dragState = useRef(null);
   const thumbnailPreviewRef = useRef(null);
 
   useEffect(() => {
-    setHeadlineText(active?.thumbnail || active?.title || '');
-    setHeadlinePosition({ x: 8, y: 72 });
-    setExportPreset(active?.platform || 'YouTube');
+    if (!active?.id) {
+      setSettingsLoadedFor(null);
+      return;
+    }
+
+    let savedSettings = null;
+    try {
+      const allSettings = JSON.parse(localStorage.getItem('creatoros_thumbnail_settings_v1') || '{}');
+      savedSettings = allSettings[active.id] || null;
+    } catch (error) {
+      console.warn('Could not read saved thumbnail settings:', error);
+    }
+
+    setHeadlineText(savedSettings?.headlineText ?? active.thumbnail ?? active.title ?? '');
+    setHeadlinePosition(savedSettings?.headlinePosition ?? { x: 8, y: 72 });
+    setExportPreset(savedSettings?.exportPreset ?? active.platform ?? 'YouTube');
+    setHeadlineFont(savedSettings?.headlineFont ?? 'Space Grotesk');
+    setHeadlineSize(savedSettings?.headlineSize ?? '25px');
+    setHeadlineAlign(savedSettings?.headlineAlign ?? 'left');
+    setHeadlineWeight(savedSettings?.headlineWeight ?? '700');
+    setTextColorMode(savedSettings?.textColorMode ?? 'auto');
+    setManualTextColor(savedSettings?.manualTextColor ?? '#ffffff');
+    setOverlayStrength(savedSettings?.overlayStrength ?? 72);
+    setTextOutline(savedSettings?.textOutline ?? true);
+    setSettingsLoadedFor(active.id);
   }, [active?.id]);
+
+  useEffect(() => {
+    if (!active?.id || settingsLoadedFor !== active.id) return;
+    const settings = {
+      headlineText, headlinePosition, exportPreset, headlineFont, headlineSize,
+      headlineAlign, headlineWeight, textColorMode, manualTextColor,
+      overlayStrength, textOutline
+    };
+    try {
+      const allSettings = JSON.parse(localStorage.getItem('creatoros_thumbnail_settings_v1') || '{}');
+      allSettings[active.id] = settings;
+      localStorage.setItem('creatoros_thumbnail_settings_v1', JSON.stringify(allSettings));
+    } catch (error) {
+      console.warn('Could not save thumbnail settings:', error);
+    }
+  }, [active?.id, settingsLoadedFor, headlineText, headlinePosition, exportPreset,
+      headlineFont, headlineSize, headlineAlign, headlineWeight, textColorMode,
+      manualTextColor, overlayStrength, textOutline]);
 
   function startHeadlineDrag(event) {
     event.preventDefault();
@@ -744,15 +812,34 @@ function Campaigns({
   }, [active?.thumbnailImage, headlinePosition.x, headlinePosition.y]);
   return <div className="campaign-page">
     <div className="page-title-row"><div><span className="eyebrow">02 / YOUR CONTENT LIBRARY</span><h1>Ideas in motion<span className="title-period">.</span></h1><p>Your ideas, organized. Your next post, closer than ever.</p></div><button className="primary-btn" onClick={() => setPage('studio')}><Plus size={17}/> New campaign</button></div>
-    <div className="campaign-toolbar"><div className="search-field"><Search size={16}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search campaigns..."/></div><span className="campaign-count">{campaigns.length} CAMPAIGNS</span></div>
+    <div className="campaign-toolbar">
+      <div className="campaign-tools-left">
+        <div className="search-field"><Search size={16}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search campaigns..."/></div>
+        <label className="campaign-sort"><span>Sort by</span><select value={campaignSort} onChange={e=>setCampaignSort(e.target.value)} aria-label="Sort campaigns"><option value="newest">Newest first</option><option value="oldest">Oldest first</option><option value="sequence">Generation order</option><option value="title">Title A–Z</option></select></label>
+      </div>
+      <span className="campaign-count">{campaigns.length} CAMPAIGNS</span>
+    </div>
     {active ? <section className="campaign-detail">
       <div className="detail-top"><button className="back-link" onClick={()=>setActiveId(null)}>← All campaigns</button><span className="status-pill"><span/> {active.status || 'Draft'}</span></div>
       <div className="detail-heading"><div><span className="eyebrow">{active.platform} CAMPAIGN</span><h2>{active.title}</h2><p>{active.topic}</p></div><div className="detail-actions"><button className="outline-btn" onClick={()=>onExport(active, exportPreset)}><Download size={15}/> Export</button><button className="icon-btn danger-btn" onClick={()=>onRemove(active.id)} title="Delete campaign"><X size={17}/></button></div></div>
+      <section className="campaign-overview">
+        <div className="overview-heading"><div><span className="eyebrow">CAMPAIGN SNAPSHOT</span><h3>Campaign overview</h3></div><span className="overview-number">#{String(active.campaignNumber || 1).padStart(3, '0')}</span></div>
+        <p className="overview-topic">{active.topic || 'No topic description available.'}</p>
+        <div className="overview-meta">
+          <div><span>PLATFORM</span><strong>{active.platform || 'Not set'}</strong></div>
+          <div><span>TARGET AUDIENCE</span><strong>{active.audience || 'General audience'}</strong></div>
+          <div><span>CAMPAIGN GOAL</span><strong>{active.goal || 'Not specified'}</strong></div>
+          <div><span>TONE</span><strong>{active.tone || 'Not specified'}</strong></div>
+        </div>
+      </section>
       <div className="output-grid">
         <OutputCard number="01" title="Hooks that stop the scroll" icon={<Flame size={17}/>}><div className="hook-list">{(active.hooks||[]).map((h,i)=><div className="hook-item" key={i}><span>0{i+1}</span><p>{h}</p><button className="tiny-copy" onClick={()=>onCopy(h)} aria-label="Copy hook"><Copy size={14}/></button></div>)}</div></OutputCard>
         <OutputCard number="02" title="Caption / post copy" icon={<MessageSquareText size={17}/>}><div className="caption-editor">{editing?<textarea value={editCaption} onChange={e=>setEditCaption(e.target.value)} rows={6}/>:<p>{active.caption}</p>}<div className="caption-actions"><button className="text-btn" onClick={()=>{if(editing){active.caption=editCaption;setEditing(false);onCopy(editCaption);}else{setEditCaption(active.caption||'');setEditing(true)}}}>{editing?'Save & copy':'Edit caption'}</button><button className="tiny-copy" onClick={()=>onCopy(editing?editCaption:active.caption)}><Copy size={14}/></button></div></div></OutputCard>
         <OutputCard number="03" title="Content angles" icon={<Grid2X2 size={17}/>}><ul className="idea-list">{(active.ideas||[]).map((x,i)=><li key={i}><span>{String(i+1).padStart(2,'0')}</span>{x}</li>)}</ul></OutputCard>
-        <OutputCard number="04" title="Thumbnail / cover direction" icon={<Instagram size={17}/>}>
+        <OutputCard number="04" title="Call to action" icon={<Zap size={17}/>}>
+          <div className="cta-card-content"><span className="cta-label">YOUR NEXT STEP FOR THE AUDIENCE</span><p>{active.cta || 'No call to action was generated for this campaign.'}</p><button className="text-btn" onClick={()=>onCopy(active.cta || '')} disabled={!active.cta}><Copy size={14}/> Copy CTA</button></div>
+        </OutputCard>
+        <OutputCard number="05" title="Thumbnail / cover direction" icon={<Instagram size={17}/>}>
           {thumbnailBusy && (
             <div className="thumbnail-status">
               <LoaderCircle size={16} className="spin" />
@@ -845,6 +932,17 @@ function Campaigns({
                 <option value="Inter">Inter</option>
                 <option value="DM Sans">DM Sans</option>
                 <option value="Playfair Display">Playfair Display</option>
+                <option value="Manrope">Manrope</option>
+                <option value="Outfit">Outfit</option>
+                <option value="Montserrat">Montserrat</option>
+                <option value="Oswald">Oswald</option>
+                <option value="Lora">Lora</option>
+                <option value="Archivo Black">Archivo Black</option>
+                <option value="Times New Roman">Times New Roman</option>
+                <option value="Forte">Forte</option>
+                <option value="Ink Free">Ink Free</option>
+                <option value="Impact">Impact</option>
+                <option value="Rockwell">Rockwell</option>
               </select>
             </label>
           </div>
@@ -977,7 +1075,7 @@ function Campaigns({
         </OutputCard>   
       </div>
       <div className="detail-bottom"><span><Clock3 size={14}/> Created {new Date(active.createdAt).toLocaleString()}</span><button className="primary-btn" onClick={()=>onExport(active, exportPreset)}><Download size={16}/> Export campaign</button></div>
-    </section> : campaigns.length ? <div className="campaign-grid">{campaigns.map((c,i)=><button className="campaign-tile" key={c.id} onClick={()=>setActiveId(c.id)}><div className={`tile-art tile-art-${i%5}`}><span>{c.platform}</span><span className="tile-number">{String(i+1).padStart(2,'0')}</span><strong>{c.thumbnail || c.title}</strong></div><div className="tile-meta"><div><h3>{c.title}</h3><p>{c.topic}</p></div><ArrowDownRight size={18}/></div><div className="tile-foot"><span>{new Date(c.createdAt).toLocaleDateString()}</span><span className="status-pill"><span/>{c.status||'Draft'}</span></div></button>)}</div> : <div className="empty-state"><div className="empty-icon"><Bookmark size={24}/></div><h2>No campaigns found.</h2><p>Try a different search or start a fresh idea.</p><button className="primary-btn" onClick={()=>setPage('studio')}><Plus size={16}/> Create your first campaign</button></div>}
+    </section> : campaigns.length ? <div className="campaign-grid">{campaigns.map((c,i)=><button className="campaign-tile" key={c.id} onClick={()=>setActiveId(c.id)}><div className={`tile-art tile-art-${i%5}`}><span>{c.platform}</span><span className="tile-number">{String(c.campaignNumber || 1).padStart(3,'0')}</span><strong>{c.thumbnail || c.title}</strong></div><div className="tile-meta"><div><h3>{c.title}</h3><p>{c.topic}</p></div><ArrowDownRight size={18}/></div><div className="tile-foot"><span>{new Date(c.createdAt).toLocaleDateString()}</span><span className="status-pill"><span/>{c.status||'Draft'}</span></div></button>)}</div> : <div className="empty-state"><div className="empty-icon"><Bookmark size={24}/></div><h2>No campaigns found.</h2><p>Try a different search or start a fresh idea.</p><button className="primary-btn" onClick={()=>setPage('studio')}><Plus size={16}/> Create your first campaign</button></div>}
     <div className="library-note"><Sparkles size={15}/> Campaigns are saved in this browser for now. Cloud sync and accounts are planned for a later build.</div>
   </div>;
 }
