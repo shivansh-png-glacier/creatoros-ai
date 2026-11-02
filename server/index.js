@@ -85,16 +85,48 @@ app.post('/api/generate', async (req, res) => {
       },
       body: JSON.stringify({
         model,
-        instructions: `You are CreatorOS, an expert content strategist.
-Create specific, useful campaigns for creators.
-Never promise guaranteed views or engagement.
-Return valid JSON only, without Markdown fences, with these fields:
-title (string), topic (string), platform (string),
-hooks (array of 3 strings), caption (string),
-cta (string), ideas (array of 3 strings),
-thumbnail (string of at most 8 words).
-Adapt the format and style to the selected platform.
-Avoid generic advice and fabricated statistics.`,
+instructions: `You are CreatorOS, a senior social content strategist and platform-native copywriter.
+
+Create campaigns that are specific, useful, and ready for creators to publish after light editing.
+
+STRATEGY:
+- Adapt every output to the exact topic, audience, platform, tone, and goal.
+- Use specific problems, desires, misconceptions, and practical outcomes.
+- Never invent statistics, testimonials, personal stories, or results.
+- Never promise guaranteed views, reach, leads, or sales.
+- Avoid generic motivational language and empty hype.
+- Make all three hooks genuinely different.
+- Make the caption useful, with practical insights, steps, or examples.
+- Make the CTA one clear action aligned with the campaign goal.
+- Keep the tone consistent across every output.
+
+PLATFORM RULES:
+- Instagram: strong first line, readable paragraphs, save-worthy value, and natural conversation.
+- YouTube: compelling video angle, clear viewer payoff, and useful video description.
+- LinkedIn: professional human perspective, practical insights, and meaningful discussion.
+- TikTok: immediate spoken hook, one focused idea, and concise copy.
+- X: concise, sharp standalone post or coherent thread concept.
+
+GOAL RULES:
+- Awareness: discoverability and shareable value.
+- Engagement: meaningful replies, opinions, and experiences.
+- Leads: relevant next steps or resources.
+- Sales: connect audience problems to product value and an honest next step.
+
+OUTPUT:
+Return valid JSON only. No Markdown fences.
+Use exactly these fields:
+title (string)
+topic (string)
+platform (string)
+hooks (array of exactly 3 strings)
+caption (string)
+cta (string)
+ideas (array of exactly 3 strings)
+thumbnail (string, maximum 8 words)
+
+All content must belong to the same campaign. Do not add extra fields.`,
+
         input: JSON.stringify({ topic, platform, audience, tone, goal }),
         temperature: 0.8,
         max_output_tokens: 4000
@@ -141,24 +173,79 @@ Avoid generic advice and fabricated statistics.`,
       });
     }
 
+        let campaign;
 
-    const campaign = JSON.parse(
-      text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim()
+    try {
+      const jsonText = text
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/, '')
+        .trim();
+
+      campaign = JSON.parse(jsonText);
+    } catch (parseError) {
+      console.error('Meta returned invalid campaign JSON:', parseError.message);
+
+      throw new Error('The AI returned invalid campaign data. Please generate again.');
+    }
+
+    if (!campaign || typeof campaign !== 'object' || Array.isArray(campaign)) {
+      throw new Error('The AI returned an invalid campaign structure.');
+    }
+
+    const requiredText = ['title', 'caption', 'cta', 'thumbnail'];
+
+    const hasRequiredText = requiredText.every(
+      key => typeof campaign[key] === 'string' && campaign[key].trim().length > 0
     );
 
+    const hasThreeHooks =
+      Array.isArray(campaign.hooks) &&
+      campaign.hooks.length === 3 &&
+      campaign.hooks.every(
+        item => typeof item === 'string' && item.trim().length > 0
+      );
+
+    const hasThreeIdeas =
+      Array.isArray(campaign.ideas) &&
+      campaign.ideas.length === 3 &&
+      campaign.ideas.every(
+        item => typeof item === 'string' && item.trim().length > 0
+      );
+
+    const thumbnailWordCount =
+      typeof campaign.thumbnail === 'string'
+        ? campaign.thumbnail.trim().split(/\s+/).filter(Boolean).length
+        : 0;
+
     if (
-      typeof campaign.title !== 'string' ||
-      typeof campaign.caption !== 'string' ||
-      !Array.isArray(campaign.hooks) ||
-      !Array.isArray(campaign.ideas)
+      !hasRequiredText ||
+      !hasThreeHooks ||
+      !hasThreeIdeas ||
+      thumbnailWordCount > 8
     ) {
-      throw new Error('Meta returned an incomplete campaign.');
+      console.error('Meta returned an invalid campaign structure.');
+      throw new Error(
+        'The AI returned incomplete campaign content. Please generate again.'
+      );
     }
+
+    const normalizedCampaign = {
+      ...campaign,
+      title: campaign.title.trim(),
+      topic,
+      platform,
+      hooks: campaign.hooks.map(item => item.trim()),
+      caption: campaign.caption.trim(),
+      cta: campaign.cta.trim(),
+      ideas: campaign.ideas.map(item => item.trim()),
+      thumbnail: campaign.thumbnail.trim()
+    };
 
     return res.json({
       mode: 'meta',
-      campaign: { ...campaign, topic, platform }
+      campaign: normalizedCampaign
     });
+
   } catch (error) {
     console.error('Campaign generation failed:', error);
 
