@@ -7,9 +7,10 @@ import {
   Sparkles, WandSparkles, X, Youtube, Zap
 } from 'lucide-react';
 import './styles.css';
+import { supabase } from './lib/supabase';
 
 const STORAGE_KEY = 'creatoros_campaigns_v1';
-const SEQUENCE_KEY = 'creatoros_campaign_sequence_v1';
+const MIGRATION_KEY = 'creatoros_cloud_migration_v1';
 const starterCampaigns = [
   { id: 'sample-1', campaignNumber: 1, title: 'The 30-minute design reset', platform: 'Instagram', topic: 'A practical design reset routine', createdAt: new Date(Date.now() - 86400000).toISOString(), status: 'Ready to edit', hooks: ['Your design workflow is not broken. Your first 30 minutes are.', 'Steal this 30-minute reset before your next project.'], caption: 'A small reset can make a messy creative workflow feel manageable. Save this for your next work session.', cta: 'Save this for your next project.', ideas: ['A 5-slide checklist carousel', 'A 20-second before/after reel', 'A desk setup story sequence'], thumbnail: 'Stop designing on autopilot' },
   { id: 'sample-2', campaignNumber: 2, title: 'Build a portfolio that gets noticed', platform: 'YouTube', topic: 'Portfolio advice for beginner designers', createdAt: new Date(Date.now() - 3 * 86400000).toISOString(), status: 'Draft', hooks: ['Your portfolio is not a gallery. It is proof you can solve problems.', '3 portfolio mistakes keeping beginner designers invisible.'], caption: 'Show the problem, your decisions, and what changed. A pretty screen is only one part of the story.', cta: 'Comment PORTFOLIO for the checklist.', ideas: ['A 6-minute breakdown video', 'A short showing one case-study fix', 'A community poll about portfolio struggles'], thumbnail: 'Your portfolio needs THIS' }
@@ -29,7 +30,11 @@ function readCampaigns() {
   } catch { return starterCampaigns; }
 }
 function App() {
-  const [campaigns, setCampaigns] = useState(readCampaigns);
+  const [campaigns, setCampaigns] = useState([]);
+  const [campaignsLoading, setCampaignsLoading] = useState(true);
+  const [cloudReady, setCloudReady] = useState(false);
+  const [cloudOwnerId, setCloudOwnerId] = useState(null);
+  const cloudSyncQueue = useRef(Promise.resolve());
   const [activeId, setActiveId] = useState(null);
   const [topic, setTopic] = useState('');
   const [platform, setPlatform] = useState('Instagram');
@@ -43,10 +48,223 @@ function App() {
   const [notice, setNotice] = useState('');
   const [query, setQuery] = useState('');
   const [campaignSort, setCampaignSort] = useState('newest');
-  const [page, setPage] = useState('studio');
+  const [page, setPage] = useState('landing');
   const [mobileNav, setMobileNav] = useState(false);
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authMode, setAuthMode] = useState('login');
+  const [authError, setAuthError] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
+  const [publicCampaignCount, setPublicCampaignCount] = useState(null);
+  const [publicCampaignCountError, setPublicCampaignCountError] = useState(false);
 
-  useEffect(() => localStorage.setItem(STORAGE_KEY, JSON.stringify(campaigns)), [campaigns]);
+  useEffect(() => {
+    if (page !== 'landing') return;
+    let cancelled = false;
+
+    async function loadPublicCampaignCount() {
+      setPublicCampaignCountError(false);
+      const { data, error } = await supabase.rpc('get_public_campaign_count');
+      if (cancelled) return;
+      if (error || !Number.isFinite(Number(data))) {
+        console.error('Could not load public campaign count:', error);
+        setPublicCampaignCountError(true);
+        return;
+      }
+      setPublicCampaignCount(Number(data));
+    }
+
+    loadPublicCampaignCount();
+    return () => { cancelled = true; };
+  }, [page]);
+
+  useEffect(() => {
+    let alive = true;
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!alive) return;
+      if (error) setAuthError(error.message);
+      const restoredSession = data?.session ?? null;
+      setSession(restoredSession);
+      // Restore the last workspace location for this account after a refresh.
+      if (restoredSession) {
+        let savedLocation = null;
+        try {
+          savedLocation = JSON.parse(sessionStorage.getItem(`creatoros_workspace_state_${restoredSession.user.id}`) || 'null');
+        } catch { /* Ignore invalid saved navigation state. */ }
+        setPage(savedLocation?.page === 'campaigns' ? 'campaigns' : 'studio');
+      } else {
+        setPage('landing');
+      }
+      setAuthLoading(false);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((event, nextSession) => {
+      setSession(nextSession);
+      setAuthError('');
+      if (event === 'SIGNED_IN') {
+        if (nextSession) setPage('studio');
+      } else if (event === 'SIGNED_OUT') {
+        setPage('landing');
+      }
+    });
+    return () => {
+      alive = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  // Load only the signed-in user's campaigns. On the first account using this
+  // browser, migrate the existing local campaign library once.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadUserCampaigns() {
+      if (authLoading) return;
+      if (!session?.user?.id) {
+        setCampaigns([]);
+        setCloudReady(false);
+        setCloudOwnerId(null);
+        setCampaignsLoading(false);
+        return;
+      }
+
+      setCampaignsLoading(true);
+      setCloudReady(false);
+      setCloudOwnerId(null);
+
+      try {
+        const { data: rows, error: fetchError } = await supabase
+          .from('campaigns')
+          .select('campaign_id, campaign_data')
+          .eq('user_id', session.user.id);
+
+        if (fetchError) throw fetchError;
+
+        let userCampaigns = (rows || [])
+          .map(row => row.campaign_data)
+          .filter(campaign => campaign && typeof campaign === 'object' && campaign.id);
+
+        const migrationDone = localStorage.getItem(MIGRATION_KEY) === 'done';
+        if (!migrationDone && userCampaigns.length === 0) {
+          let localCampaigns = [];
+          try {
+            localCampaigns = readCampaigns().filter(campaign => !String(campaign.id).startsWith('sample-'));
+          } catch (parseError) {
+            console.warn('Could not read local campaigns for migration:', parseError);
+          }
+
+          if (localCampaigns.length) {
+            const migrationRows = localCampaigns.map(campaign => ({
+              user_id: session.user.id,
+              campaign_id: String(campaign.id),
+              campaign_data: campaign
+            }));
+            const { error: migrationError } = await supabase
+              .from('campaigns')
+              .upsert(migrationRows, { onConflict: 'user_id,campaign_id' });
+            if (migrationError) throw migrationError;
+            userCampaigns = localCampaigns;
+          }
+          localStorage.setItem(MIGRATION_KEY, 'done');
+        } else if (!migrationDone) {
+          // Existing cloud data is authoritative; don't import another user's
+          // browser-local cache into this account.
+          localStorage.setItem(MIGRATION_KEY, 'done');
+        }
+
+        // Campaign numbering belongs to the signed-in account, not the browser.
+        // Normalize legacy numbers that may have been generated by a shared
+        // localStorage counter before cloud storage was introduced.
+        userCampaigns = [...userCampaigns]
+          .sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0))
+          .map((campaign, index) => ({ ...campaign, campaignNumber: index + 1 }));
+
+        if (!cancelled) {
+          setCampaigns(userCampaigns);
+          let savedLocation = null;
+          try {
+            savedLocation = JSON.parse(sessionStorage.getItem(`creatoros_workspace_state_${session.user.id}`) || 'null');
+          } catch { /* Ignore invalid saved navigation state. */ }
+          const restoredActiveId = savedLocation?.activeId;
+          setActiveId(restoredActiveId && userCampaigns.some(campaign => campaign.id === restoredActiveId) ? restoredActiveId : null);
+          setCloudOwnerId(session.user.id);
+          setCloudReady(true);
+        }
+      } catch (loadError) {
+        console.error('Campaign cloud load failed:', loadError);
+        if (!cancelled) {
+          setError(`Could not load your cloud campaigns: ${loadError.message}`);
+          setCampaigns([]);
+        }
+      } finally {
+        if (!cancelled) setCampaignsLoading(false);
+      }
+    }
+
+    loadUserCampaigns();
+    return () => { cancelled = true; };
+  }, [session?.user?.id, authLoading]);
+
+  // Keep the current workspace location across refreshes, scoped to this account.
+  useEffect(() => {
+    if (!cloudReady || !session?.user?.id || cloudOwnerId !== session.user.id) return;
+    try {
+      sessionStorage.setItem(`creatoros_workspace_state_${session.user.id}`, JSON.stringify({
+        page: page === 'campaigns' ? 'campaigns' : 'studio',
+        activeId
+      }));
+    } catch (storageError) {
+      console.warn('Could not save workspace location:', storageError);
+    }
+  }, [page, activeId, cloudReady, cloudOwnerId, session?.user?.id]);
+
+  // Persist each signed-in user's complete campaign list. The queue prevents
+  // overlapping saves from an older render overwriting a newer edit.
+  useEffect(() => {
+    if (!cloudReady || !session?.user?.id || cloudOwnerId !== session.user.id) return;
+    const userId = session.user.id;
+    const snapshot = campaigns.map(campaign => ({ ...campaign }));
+
+    cloudSyncQueue.current = cloudSyncQueue.current
+      .catch(() => {})
+      .then(async () => {
+        const rows = snapshot.map(campaign => ({
+          user_id: userId,
+          campaign_id: String(campaign.id),
+          campaign_data: campaign
+        }));
+
+        if (rows.length) {
+          const { error: saveError } = await supabase
+            .from('campaigns')
+            .upsert(rows, { onConflict: 'user_id,campaign_id' });
+          if (saveError) throw saveError;
+        }
+
+        const { data: existingRows, error: listError } = await supabase
+          .from('campaigns')
+          .select('campaign_id')
+          .eq('user_id', userId);
+        if (listError) throw listError;
+
+        const keepIds = new Set(snapshot.map(campaign => String(campaign.id)));
+        const staleIds = (existingRows || [])
+          .map(row => row.campaign_id)
+          .filter(id => !keepIds.has(String(id)));
+
+        if (staleIds.length) {
+          const { error: deleteError } = await supabase
+            .from('campaigns')
+            .delete()
+            .eq('user_id', userId)
+            .in('campaign_id', staleIds);
+          if (deleteError) throw deleteError;
+        }
+      })
+      .catch(syncError => {
+        console.error('Campaign cloud sync failed:', syncError);
+        setError(`Cloud save failed: ${syncError.message}`);
+      });
+  }, [campaigns, cloudReady, cloudOwnerId, session?.user?.id]);
   const active = campaigns.find(c => c.id === activeId) || null;
   const visibleCampaigns = useMemo(() => {
     const filtered = campaigns.filter(c => `${c.title} ${c.topic} ${c.platform}`.toLowerCase().includes(query.toLowerCase()));
@@ -62,6 +280,51 @@ function App() {
     setNotice(message);
     window.setTimeout(() => setNotice(''), 2400);
   }
+  async function submitAuth(email, password, displayName) {
+    setAuthBusy(true);
+    setAuthError('');
+    try {
+      if (authMode === 'signup') {
+        const { data, error } = await supabase.auth.signUp({
+          email: email.trim(),
+          password,
+          options: { data: { display_name: displayName.trim() || email.trim().split('@')[0] } }
+        });
+        if (error) throw error;
+        if (data.session) {
+          setPage('studio');
+          flash('Account created successfully.');
+        } else {
+          setAuthError('Account created. Check your email to confirm your address, then log in.');
+          setAuthMode('login');
+        }
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({
+          email: email.trim(),
+          password
+        });
+        if (error) throw error;
+        setPage('studio');
+        flash('Welcome back.');
+      }
+    } catch (error) {
+      setAuthError(error.message || 'Authentication failed. Please try again.');
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function signOut() {
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      flash(error.message || 'Could not sign out.');
+      return;
+    }
+    setPage('landing');
+    setActiveId(null);
+    flash('Signed out.');
+  }
+
   async function generate() {
     if (topic.trim().length < 4) {
       setError('Add a little more detail to your idea (at least 4 characters).');
@@ -82,11 +345,9 @@ function App() {
         throw new Error(`Invalid server response (HTTP ${response.status}). Check the backend terminal.`);
       }
       if (!response.ok) throw new Error(data.error || data.message || 'Could not generate the campaign.');
-      const nextCampaignNumber = Math.max(
-        Number(localStorage.getItem(SEQUENCE_KEY)) || 0,
-        campaigns.reduce((highest, item) => Math.max(highest, Number(item.campaignNumber) || 0), 0)
-      ) + 1;
-      localStorage.setItem(SEQUENCE_KEY, String(nextCampaignNumber));
+      // The sequence is derived only from this authenticated user's campaigns.
+      const nextCampaignNumber =
+        campaigns.reduce((highest, item) => Math.max(highest, Number(item.campaignNumber) || 0), 0) + 1;
       const campaign = {
         ...data.campaign,
         audience,
@@ -157,6 +418,12 @@ function App() {
     try { await navigator.clipboard.writeText(text); flash('Copied to clipboard'); }
     catch { flash('Clipboard unavailable — select and copy the text.'); }
   }
+  function updateCampaign(id, updates) {
+    setCampaigns(previous => previous.map(campaign =>
+      campaign.id === id ? { ...campaign, ...updates } : campaign
+    ));
+  }
+
   function removeCampaign(id) {
     setCampaigns(previous => previous.filter(c => c.id !== id));
     if (activeId === id) setActiveId(null);
@@ -385,6 +652,30 @@ function App() {
     { id: 'campaigns', label: 'My campaigns', icon: Grid2X2 },
   ];
 
+  if (authLoading || (session && campaignsLoading)) {
+    return <div className="auth-loading-screen"><div className="auth-loading-mark"><Zap size={22} fill="currentColor" /></div><p>Loading your private workspace…</p></div>;
+  }
+
+  if (page === 'auth' || (!session && page !== 'landing')) {
+    return <AuthPage
+      mode={authMode}
+      setMode={(mode) => { setAuthMode(mode); setAuthError(''); }}
+      onSubmit={submitAuth}
+      busy={authBusy}
+      error={authError}
+      onBack={() => { setPage('landing'); setAuthError(''); }}
+    />;
+  }
+
+  if (page === 'landing') {
+    return <Landing
+      campaignCount={publicCampaignCount}
+      campaignCountError={publicCampaignCountError}
+      onEnter={() => { setAuthMode('signup'); setAuthError(''); setPage(session ? 'studio' : 'auth'); }}
+      onLogin={() => { setAuthMode('login'); setAuthError(''); setPage(session ? 'studio' : 'auth'); }}
+    />;
+  }
+
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav ? 'sidebar-open' : ''}`}>
       <div className="brand">
@@ -423,12 +714,12 @@ function App() {
       <div className="sidebar-bottom">
         <div className="sidebar-tip"><div className="tip-icon"><Lightbulb size={16}/></div><strong>Creator tip</strong><p>Specific ideas beat broad topics. Tell the AI who you're helping and what they'll learn.</p><button onClick={() => {setPage('studio'); setTopic('3 mistakes beginner UI designers make when building their first portfolio');}}>Try this idea <ArrowRight size={13}/></button></div>
         <button className="nav-item muted-nav" onClick={() => flash('Settings are coming in the next build.')}><Settings2 size={17}/> Settings <span className="soon">SOON</span></button>
-        <div className="profile-row"><div className="profile-avatar">S</div><div className="profile-copy"><strong>Creator workspace</strong><small>Free plan · MVP</small></div><CircleHelp size={17} className="help-icon" onClick={() => flash('CreatorOS AI starter build · feedback welcome.')}/></div>
+        <div className="profile-row"><div className="profile-avatar">{(session?.user?.user_metadata?.display_name || session?.user?.email || 'C').slice(0,1).toUpperCase()}</div><div className="profile-copy"><strong>{session?.user?.user_metadata?.display_name || 'Creator workspace'}</strong><small>{session?.user?.email || 'Signed in'}</small></div><button className="signout-btn" onClick={signOut} title="Sign out">↗</button></div>
       </div>
     </aside>
     {mobileNav && <button className="nav-scrim" onClick={() => setMobileNav(false)} aria-label="Close navigation"/>}
     <main className="main-area">
-      <header className="topbar"><button className="icon-btn mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open menu"><Menu size={19}/></button><div className="breadcrumb">Workspace <span>/</span> <strong>{page === 'studio' ? 'Idea studio' : 'My campaigns'}</strong></div><div className="topbar-right"><div className="ai-status"><span/> AI workspace</div><div className="top-avatar">S</div></div></header>
+      <header className="topbar"><button className="icon-btn mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open menu"><Menu size={19}/></button><div className="breadcrumb">Workspace <span>/</span> <strong>{page === 'studio' ? 'Idea studio' : 'My campaigns'}</strong></div><div className="topbar-right"><div className="ai-status"><span/> AI workspace</div><div className="top-avatar" title={session?.user?.email || 'Signed in'}>{(session?.user?.user_metadata?.display_name || session?.user?.email || 'C').slice(0,1).toUpperCase()}</div></div></header>
       <div className="content-wrap">
         {page === 'studio' ? <Studio topic={topic} setTopic={setTopic} platform={platform} setPlatform={setPlatform} audience={audience} setAudience={setAudience} tone={tone} setTone={setTone} goal={goal} setGoal={setGoal} busy={busy} error={error} generate={generate} setPage={setPage} campaigns={campaigns} setActiveId={setActiveId} /> :
           <Campaigns
@@ -442,6 +733,7 @@ function App() {
             onCopy={copyText}
             onExport={exportCampaign}
             onRemove={removeCampaign}
+            onUpdateCampaign={updateCampaign}
             setPage={setPage}
             thumbnailBusy={thumbnailBusy}
             thumbnailError={thumbnailError}
@@ -451,6 +743,106 @@ function App() {
       <footer className="app-footer"><span>CREATOROS AI <span className="footer-dot">•</span> BUILT FOR THE NEXT BIG IDEA</span><span>MAKE SOMETHING THAT MATTERS ↗</span></footer>
     </main>
     {notice && <div className="toast"><Check size={16}/>{notice}</div>}
+  </div>;
+}
+
+
+function AuthPage({ mode, setMode, onSubmit, busy, error, onBack }) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [displayName, setDisplayName] = useState('');
+
+  function handleSubmit(event) {
+    event.preventDefault();
+    onSubmit(email, password, displayName);
+  }
+
+  return <main className="auth-shell">
+    <div className="auth-aurora auth-aurora-a" />
+    <div className="auth-aurora auth-aurora-b" />
+    <button className="auth-back" onClick={onBack}>← Back to CreatorOS</button>
+    <section className="auth-card">
+      <div className="auth-brand-mark"><Zap size={22} fill="currentColor" /></div>
+      <span className="auth-eyebrow">CREATOROS AI / YOUR CREATIVE WORKSPACE</span>
+      <h1>{mode === 'signup' ? 'Create your account.' : 'Welcome back.'}</h1>
+      <p>{mode === 'signup' ? 'Set up your account and start turning ideas into campaigns.' : 'Sign in to continue building your next campaign.'}</p>
+      <form onSubmit={handleSubmit}>
+        {mode === 'signup' && <label className="auth-field"><span>NAME</span><input value={displayName} onChange={e => setDisplayName(e.target.value)} autoComplete="name" placeholder="Your name" maxLength={80} /></label>}
+        <label className="auth-field"><span>EMAIL ADDRESS</span><input type="email" value={email} onChange={e => setEmail(e.target.value)} autoComplete="email" required placeholder="you@example.com" /></label>
+        <label className="auth-field"><span>PASSWORD</span><input type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete={mode === 'signup' ? 'new-password' : 'current-password'} minLength={6} required placeholder="At least 6 characters" /></label>
+        {error && <div className="auth-error" role="alert">{error}</div>}
+        <button className="auth-submit" type="submit" disabled={busy}>{busy ? 'Please wait…' : mode === 'signup' ? 'Create account →' : 'Log in →'}</button>
+      </form>
+      <div className="auth-switch">{mode === 'signup' ? 'Already have an account?' : 'New to CreatorOS?'} <button onClick={() => setMode(mode === 'signup' ? 'login' : 'signup')}>{mode === 'signup' ? 'Log in' : 'Create an account'}</button></div>
+      <div className="auth-security-note">Your account is secured by Supabase authentication.</div>
+    </section>
+  </main>;
+}
+
+function Landing({ onEnter, onLogin, campaignCount, campaignCountError }) {
+  return <div className="landing-shell">
+    <div className="landing-aurora landing-aurora-one" />
+    <div className="landing-aurora landing-aurora-two" />
+    <nav className="landing-nav">
+      <a className="landing-brand" href="#top" aria-label="CreatorOS AI home">
+        <span className="landing-brand-mark"><Zap size={19} fill="currentColor" /></span>
+        <span>creator<span>OS</span><sup>AI</sup></span>
+      </a>
+      <div className="landing-nav-links">
+        <a href="#features">Features</a><a href="#how-it-works">How it works</a><a href="#showcase">Product</a>
+      </div>
+      <div className="landing-nav-actions">
+        <button className="landing-login" onClick={onLogin}>Log in</button>
+        <button className="landing-nav-cta" onClick={onEnter}>Get started <ArrowRight size={15}/></button>
+      </div>
+    </nav>
+
+    <main id="top">
+      <section className="landing-hero">
+        <div className="landing-hero-copy">
+          <div className="landing-eyebrow"><span className="landing-live-dot"/> YOUR IDEAS, IN MOTION <span className="landing-eyebrow-line"/></div>
+          <h1>Turn one idea into a <span>whole campaign.</span></h1>
+          <p className="landing-hero-description">A creative workspace for people who make things. Build campaign angles, write platform-ready content and design scroll-stopping thumbnails—all in one flow.</p>
+          <div className="landing-hero-actions"><button className="landing-primary" onClick={onEnter}>Create your first campaign <ArrowRight size={17}/></button><a className="landing-secondary" href="#showcase">Explore the workspace <ArrowDownRight size={16}/></a></div>
+          <div className="landing-proof"><div className="landing-proof-avatars"><span>C</span><span>✳</span><span>OS</span></div><span>From first thought to publish-ready direction.</span></div>
+        </div>
+        <div className="landing-hero-visual" aria-label="CreatorOS campaign workspace preview">
+          <div className="landing-orbit orbit-one"/><div className="landing-orbit orbit-two"/>
+          <div className="landing-preview-window">
+            <div className="landing-preview-top"><div className="landing-window-dots"><i/><i/><i/></div><span>CREATOROS / CAMPAIGN STUDIO</span><span className="landing-preview-status"><b/> LIVE WORKSPACE</span></div>
+            <div className="landing-preview-body">
+              <div className="landing-preview-sidebar"><div className="landing-mini-logo"><Zap size={14} fill="currentColor"/></div><i/><i/><i/><i/></div>
+              <div className="landing-preview-main"><div className="landing-preview-kicker">CAMPAIGN OVERVIEW <span>01 / 04</span></div><h3>Make your next<br/><em>big idea</em> count.</h3><p>One clear idea. A complete content direction.</p>
+                <div className="landing-preview-tags"><span>Instagram</span><span>Awareness</span><span>Educational</span></div>
+                <div className="landing-preview-output"><div><small>01 / HOOK</small><strong>Your next big idea starts here.</strong></div><div><small>02 / CONTENT ANGLE</small><strong>Turn a simple insight into a story.</strong></div><div><small>03 / CREATIVE</small><strong>Thumbnail direction generated <Sparkles size={13}/></strong></div></div>
+              </div>
+              <div className="landing-preview-float"><span className="landing-float-icon"><Sparkles size={16}/></span><div><small>CREATIVE MOMENTUM</small><strong>Idea → Campaign</strong></div><span className="landing-float-check"><Check size={14}/></span></div>
+            </div>
+          </div>
+          <div className="landing-glass-chip chip-top"><span className="chip-pulse"/> AI-powered workflow</div>
+          <div className="landing-glass-chip chip-bottom"><WandSparkles size={15}/> Made for makers</div>
+        </div>
+      </section>
+
+      <section className="landing-trust-strip"><span>ONE WORKSPACE</span><i/> <span>MORE CREATIVE CLARITY</span><i/> <span>LESS STARTING FROM ZERO</span><i/> <span>BUILT FOR THE NEXT BIG IDEA</span></section>
+
+      <section className="landing-community-count" aria-live="polite"><div className="landing-community-count-inner"><span className="landing-section-label">THE CREATOROS COMMUNITY</span><strong>{campaignCountError ? '—' : campaignCount === null ? '…' : campaignCount.toLocaleString('en-IN')}</strong><p>campaigns generated by creators using CreatorOS AI</p></div></section>
+
+      <section className="landing-section" id="features"><div className="landing-section-heading"><span className="landing-section-label">THE CREATOROS TOOLKIT / 01</span><h2>Everything you need to<br/><span>move an idea forward.</span></h2><p>Skip the scattered tabs and disconnected tools. Keep the thinking, writing and visual direction connected.</p></div>
+        <div className="landing-feature-grid">
+          <article className="landing-feature-card feature-large"><div className="feature-card-top"><span>01 / STRATEGY</span><span className="feature-icon"><Lightbulb size={18}/></span></div><div className="feature-visual feature-strategy"><div className="strategy-orb"/><div className="strategy-lines"><i/><i/><i/></div><span className="strategy-label">IDEA → IMPACT</span></div><h3>Campaigns with a clear direction.</h3><p>Turn a rough topic into a focused campaign with hooks, captions, calls to action and content angles.</p></article>
+          <article className="landing-feature-card"><div className="feature-card-top"><span>02 / CONTENT</span><span className="feature-icon"><MessageSquareText size={18}/></span></div><div className="feature-visual feature-content"><div className="content-sheet"><small>YOUR CAPTION</small><b>Start with a hook<br/>worth stopping for.</b><i/><i/><i/></div><span className="content-spark"><Sparkles size={18}/></span></div><h3>Copy you can make your own.</h3><p>Generate platform-aware hooks and captions, then edit and copy what works.</p></article>
+          <article className="landing-feature-card"><div className="feature-card-top"><span>03 / DESIGN</span><span className="feature-icon"><WandSparkles size={18}/></span></div><div className="feature-visual feature-design"><div className="design-image"><span>MAKE<br/>IT<br/><b>MATTER.</b></span></div><div className="design-controls"><i/><i/><i/></div></div><h3>Visuals that complete the story.</h3><p>Create thumbnail backgrounds and refine headline style, placement, colour and export format.</p></article>
+        </div>
+      </section>
+
+      <section className="landing-workflow" id="how-it-works"><div className="workflow-heading"><span className="landing-section-label">A SIMPLE CREATIVE FLOW / 02</span><h2>From blank page<br/>to <span>next move.</span></h2><p>Keep momentum without overcomplicating the process.</p></div><div className="workflow-steps"><div className="workflow-step"><span>01</span><div className="workflow-step-icon"><Lightbulb size={20}/></div><h3>Bring the idea</h3><p>Start with a topic, audience, platform and goal.</p></div><div className="workflow-connector"><ArrowRight size={18}/></div><div className="workflow-step"><span>02</span><div className="workflow-step-icon"><Sparkles size={20}/></div><h3>Shape the campaign</h3><p>Generate hooks, captions, content angles and a clear CTA.</p></div><div className="workflow-connector"><ArrowRight size={18}/></div><div className="workflow-step"><span>03</span><div className="workflow-step-icon"><Download size={20}/></div><h3>Make it yours</h3><p>Edit your copy, design the thumbnail and export your work.</p></div></div></section>
+
+      <section className="landing-showcase" id="showcase"><div className="showcase-copy"><span className="landing-section-label">INSIDE THE WORKSPACE / 03</span><h2>Your creative process,<br/><span>all in one place.</span></h2><p>Organize campaigns, revisit ideas and refine the details before you publish. CreatorOS keeps the workflow focused on making—not managing more tools.</p><ul><li><Check size={15}/> Save and revisit campaign drafts</li><li><Check size={15}/> Customize thumbnail typography and layout</li><li><Check size={15}/> Export campaign briefs and PNG thumbnails</li></ul><button className="landing-primary" onClick={onEnter}>Explore CreatorOS <ArrowRight size={17}/></button></div><div className="showcase-art"><div className="showcase-glow"/><div className="showcase-card showcase-back"><span>MY CAMPAIGNS</span><i/><i/><i/></div><div className="showcase-card showcase-front"><div className="showcase-card-head"><span>THUMBNAIL EDITOR</span><span>● READY</span></div><div className="showcase-thumbnail"><span>MAKE<br/><b>IT</b><br/>MATTER.</span><small>THE BIG IDEA</small></div><div className="showcase-tools"><i/><i/><i/><i/></div></div><div className="showcase-badge"><Check size={14}/> Ready to export</div></div></section>
+
+      <section className="landing-final-cta"><div className="final-cta-glow"/><span className="landing-section-label">YOUR NEXT BIG IDEA IS WAITING</span><h2>Make something<br/><span>that matters.</span></h2><p>Start with one idea. See where you can take it.</p><button className="landing-primary" onClick={onEnter}>Start creating <ArrowRight size={17}/></button><div className="final-cta-star">✳</div></section>
+    </main>
+    <footer className="landing-footer"><a className="landing-brand" href="#top"><span className="landing-brand-mark"><Zap size={17} fill="currentColor"/></span><span>creator<span>OS</span><sup>AI</sup></span></a><span>CREATOROS AI · BUILT FOR THE NEXT BIG IDEA</span><a href="#top">Back to top ↑</a></footer>
   </div>;
 }
 
@@ -494,6 +886,7 @@ function Campaigns({
   onCopy,
   onExport,
   onRemove,
+  onUpdateCampaign,
   setPage,
   thumbnailBusy,
   thumbnailError,
@@ -509,14 +902,13 @@ function Campaigns({
   const [manualTextColor, setManualTextColor] = useState('#ffffff');
   const [overlayStrength, setOverlayStrength] = useState(72);
   const [textOutline, setTextOutline] = useState(true);
-  const [headlineSize, setHeadlineSize] = useState('25px');
+  const [headlineSize, setHeadlineSize] = useState('19');
   const [headlineAlign, setHeadlineAlign] = useState('left');
   const [headlineWeight, setHeadlineWeight] = useState('700');
   const [headlineFont, setHeadlineFont] = useState('Space Grotesk');
   const [headlineText, setHeadlineText] = useState('');
   const [imageEditPrompt, setImageEditPrompt] = useState('');
   const [headlinePosition, setHeadlinePosition] = useState({ x: 8, y: 72 });
-  const [exportPreset, setExportPreset] = useState('YouTube');
   const [settingsLoadedFor, setSettingsLoadedFor] = useState(null);
   const dragState = useRef(null);
   const thumbnailPreviewRef = useRef(null);
@@ -537,9 +929,14 @@ function Campaigns({
 
     setHeadlineText(savedSettings?.headlineText ?? active.thumbnail ?? active.title ?? '');
     setHeadlinePosition(savedSettings?.headlinePosition ?? { x: 8, y: 72 });
-    setExportPreset(savedSettings?.exportPreset ?? active.platform ?? 'YouTube');
     setHeadlineFont(savedSettings?.headlineFont ?? 'Space Grotesk');
-    setHeadlineSize(savedSettings?.headlineSize ?? '25px');
+    const savedSize = savedSettings?.headlineSize;
+    const normalizedSize = savedSize == null
+      ? '19'
+      : String(savedSize).endsWith('px')
+        ? String(Number.parseFloat(savedSize) * 0.75)
+        : String(savedSize);
+    setHeadlineSize(normalizedSize);
     setHeadlineAlign(savedSettings?.headlineAlign ?? 'left');
     setHeadlineWeight(savedSettings?.headlineWeight ?? '700');
     setTextColorMode(savedSettings?.textColorMode ?? 'auto');
@@ -552,7 +949,7 @@ function Campaigns({
   useEffect(() => {
     if (!active?.id || settingsLoadedFor !== active.id) return;
     const settings = {
-      headlineText, headlinePosition, exportPreset, headlineFont, headlineSize,
+      headlineText, headlinePosition, headlineFont, headlineSize,
       headlineAlign, headlineWeight, textColorMode, manualTextColor,
       overlayStrength, textOutline
     };
@@ -563,7 +960,7 @@ function Campaigns({
     } catch (error) {
       console.warn('Could not save thumbnail settings:', error);
     }
-  }, [active?.id, settingsLoadedFor, headlineText, headlinePosition, exportPreset,
+  }, [active?.id, settingsLoadedFor, headlineText, headlinePosition,
       headlineFont, headlineSize, headlineAlign, headlineWeight, textColorMode,
       manualTextColor, overlayStrength, textOutline]);
 
@@ -602,13 +999,14 @@ function Campaigns({
         if (image.complete && image.naturalWidth) resolve();
       });
 
+      const exportPlatform = active.platform || 'YouTube';
       const dimensions = {
         Instagram: [1080, 1350],
         YouTube: [1280, 720],
         LinkedIn: [1200, 627],
         TikTok: [1080, 1920],
         X: [1200, 675]
-      }[exportPreset] || [1280, 720];
+      }[exportPlatform] || [1280, 720];
       const [canvasWidth, canvasHeight] = dimensions;
       const canvas = document.createElement('canvas');
       canvas.width = canvasWidth;
@@ -639,7 +1037,7 @@ function Campaigns({
       const previewWidth = thumbnailPreviewRef.current.getBoundingClientRect().width;
       const unit = canvasWidth / previewWidth;
       const headlineColor = textColorMode === 'manual' ? manualTextColor : thumbnailTextStyle.color;
-      const fontSize = Number.parseFloat(headlineSize) * unit;
+      const fontSize = ((Number.parseFloat(headlineSize) || 19) * (4 / 3)) * unit;
       const lineHeight = fontSize * 1.1;
       const left = (headlinePosition.x / 100) * canvasWidth;
       const top = (headlinePosition.y / 100) * canvasHeight;
@@ -657,10 +1055,10 @@ function Campaigns({
 
       // Wrap the headline to the same 84% text area used in the preview.
       if (document.fonts?.load) {
-        await document.fonts.load(`${headlineWeight} ${fontSize}px '${headlineFont}'`);
+        await document.fonts.load(`${headlineFont === 'Archivo Black' ? 900 : headlineWeight} ${fontSize}px '${headlineFont}'`);
       }
       context.save();
-      context.font = `${headlineWeight} ${fontSize}px '${headlineFont}', sans-serif`;
+      context.font = `${headlineFont === 'Archivo Black' ? 900 : headlineWeight} ${fontSize}px '${headlineFont}', sans-serif`;
       context.textAlign = align;
       context.textBaseline = 'top';
       context.lineJoin = 'round';
@@ -821,7 +1219,7 @@ function Campaigns({
     </div>
     {active ? <section className="campaign-detail">
       <div className="detail-top"><button className="back-link" onClick={()=>setActiveId(null)}>← All campaigns</button><span className="status-pill"><span/> {active.status || 'Draft'}</span></div>
-      <div className="detail-heading"><div><span className="eyebrow">{active.platform} CAMPAIGN</span><h2>{active.title}</h2><p>{active.topic}</p></div><div className="detail-actions"><button className="outline-btn" onClick={()=>onExport(active, exportPreset)}><Download size={15}/> Export</button><button className="icon-btn danger-btn" onClick={()=>onRemove(active.id)} title="Delete campaign"><X size={17}/></button></div></div>
+      <div className="detail-heading"><div><span className="eyebrow">{active.platform} CAMPAIGN</span><h2>{active.title}</h2><p>{active.topic}</p></div><div className="detail-actions"><button className="outline-btn" onClick={()=>onExport(active, active.platform)}><Download size={15}/> Export</button><button className="icon-btn danger-btn" onClick={()=>onRemove(active.id)} title="Delete campaign"><X size={17}/></button></div></div>
       <section className="campaign-overview">
         <div className="overview-heading"><div><span className="eyebrow">CAMPAIGN SNAPSHOT</span><h3>Campaign overview</h3></div><span className="overview-number">#{String(active.campaignNumber || 1).padStart(3, '0')}</span></div>
         <p className="overview-topic">{active.topic || 'No topic description available.'}</p>
@@ -834,7 +1232,7 @@ function Campaigns({
       </section>
       <div className="output-grid">
         <OutputCard number="01" title="Hooks that stop the scroll" icon={<Flame size={17}/>}><div className="hook-list">{(active.hooks||[]).map((h,i)=><div className="hook-item" key={i}><span>0{i+1}</span><p>{h}</p><button className="tiny-copy" onClick={()=>onCopy(h)} aria-label="Copy hook"><Copy size={14}/></button></div>)}</div></OutputCard>
-        <OutputCard number="02" title="Caption / post copy" icon={<MessageSquareText size={17}/>}><div className="caption-editor">{editing?<textarea value={editCaption} onChange={e=>setEditCaption(e.target.value)} rows={6}/>:<p>{active.caption}</p>}<div className="caption-actions"><button className="text-btn" onClick={()=>{if(editing){active.caption=editCaption;setEditing(false);onCopy(editCaption);}else{setEditCaption(active.caption||'');setEditing(true)}}}>{editing?'Save & copy':'Edit caption'}</button><button className="tiny-copy" onClick={()=>onCopy(editing?editCaption:active.caption)}><Copy size={14}/></button></div></div></OutputCard>
+        <OutputCard number="02" title="Caption / post copy" icon={<MessageSquareText size={17}/>}><div className="caption-editor">{editing?<textarea value={editCaption} onChange={e=>setEditCaption(e.target.value)} rows={6}/>:<p>{active.caption}</p>}<div className="caption-actions"><button className="text-btn" onClick={()=>{if(editing){onUpdateCampaign(active.id, { caption: editCaption });setEditing(false);onCopy(editCaption);}else{setEditCaption(active.caption||'');setEditing(true)}}}>{editing?'Save & copy':'Edit caption'}</button><button className="tiny-copy" onClick={()=>onCopy(editing?editCaption:active.caption)}><Copy size={14}/></button></div></div></OutputCard>
         <OutputCard number="03" title="Content angles" icon={<Grid2X2 size={17}/>}><ul className="idea-list">{(active.ideas||[]).map((x,i)=><li key={i}><span>{String(i+1).padStart(2,'0')}</span>{x}</li>)}</ul></OutputCard>
         <OutputCard number="04" title="Call to action" icon={<Zap size={17}/>}>
           <div className="cta-card-content"><span className="cta-label">YOUR NEXT STEP FOR THE AUDIENCE</span><p>{active.cta || 'No call to action was generated for this campaign.'}</p><button className="text-btn" onClick={()=>onCopy(active.cta || '')} disabled={!active.cta}><Copy size={14}/> Copy CTA</button></div>
@@ -949,12 +1347,16 @@ function Campaigns({
 
           <div className="thumbnail-controls">
             <label className="thumbnail-control">
-              <span>Text size</span>
-              <select value={headlineSize} onChange={event => setHeadlineSize(event.target.value)}>
-                <option value="20px">Small</option>
-                <option value="25px">Medium</option>
-                <option value="32px">Large</option>
-              </select>
+              <span>Font size (pt)</span>
+              <input
+                type="number"
+                min="8"
+                max="120"
+                step="0.5"
+                value={headlineSize}
+                onChange={event => setHeadlineSize(event.target.value)}
+                aria-label="Headline font size in points"
+              />
             </label>
             <label className="thumbnail-control">
               <span>Alignment</span>
@@ -974,17 +1376,6 @@ function Campaigns({
             </label>
           </div>
 
-          <label className="thumbnail-control thumbnail-export-preset">
-            <span>Export format</span>
-            <select value={exportPreset} onChange={event => setExportPreset(event.target.value)}>
-              <option value="Instagram">Instagram Post · 1080 × 1350</option>
-              <option value="YouTube">YouTube Thumbnail · 1280 × 720</option>
-              <option value="LinkedIn">LinkedIn · 1200 × 627</option>
-              <option value="TikTok">TikTok · 1080 × 1920</option>
-              <option value="X">X · 1200 × 675</option>
-            </select>
-          </label>
-
           <div
             className="thumbnail-preview"
             ref={thumbnailPreviewRef}
@@ -998,7 +1389,7 @@ function Campaigns({
                 LinkedIn: '1200 / 627',
                 TikTok: '9 / 16',
                 X: '16 / 9'
-              }[exportPreset] || '16 / 9'
+              }[active.platform] || '16 / 9'
             }}
           >
             {active.thumbnailImage ? (
@@ -1031,8 +1422,9 @@ function Campaigns({
               <span>THE BIG IDEA</span>
               <strong
                 style={{
-                  fontSize: headlineSize,
-                  fontWeight: headlineWeight,
+                  fontSize: `${(Number.parseFloat(headlineSize) || 19) * (4 / 3)}px`,
+                  fontWeight: headlineFont === 'Archivo Black' ? 900 : headlineWeight,
+                  fontSynthesis: 'weight',
                   fontFamily: `'${headlineFont}', sans-serif`,
                   textAlign: headlineAlign,
                   color: textColorMode === 'manual' ? manualTextColor : thumbnailTextStyle.color,
@@ -1074,9 +1466,9 @@ function Campaigns({
           </button>
         </OutputCard>   
       </div>
-      <div className="detail-bottom"><span><Clock3 size={14}/> Created {new Date(active.createdAt).toLocaleString()}</span><button className="primary-btn" onClick={()=>onExport(active, exportPreset)}><Download size={16}/> Export campaign</button></div>
+      <div className="detail-bottom"><span><Clock3 size={14}/> Created {new Date(active.createdAt).toLocaleString()}</span><button className="primary-btn" onClick={()=>onExport(active, active.platform)}><Download size={16}/> Export campaign</button></div>
     </section> : campaigns.length ? <div className="campaign-grid">{campaigns.map((c,i)=><button className="campaign-tile" key={c.id} onClick={()=>setActiveId(c.id)}><div className={`tile-art tile-art-${i%5}`}><span>{c.platform}</span><span className="tile-number">{String(c.campaignNumber || 1).padStart(3,'0')}</span><strong>{c.thumbnail || c.title}</strong></div><div className="tile-meta"><div><h3>{c.title}</h3><p>{c.topic}</p></div><ArrowDownRight size={18}/></div><div className="tile-foot"><span>{new Date(c.createdAt).toLocaleDateString()}</span><span className="status-pill"><span/>{c.status||'Draft'}</span></div></button>)}</div> : <div className="empty-state"><div className="empty-icon"><Bookmark size={24}/></div><h2>No campaigns found.</h2><p>Try a different search or start a fresh idea.</p><button className="primary-btn" onClick={()=>setPage('studio')}><Plus size={16}/> Create your first campaign</button></div>}
-    <div className="library-note"><Sparkles size={15}/> Campaigns are saved in this browser for now. Cloud sync and accounts are planned for a later build.</div>
+    <div className="library-note"><Sparkles size={15}/> Your campaigns are saved to your private CreatorOS cloud workspace.</div>
   </div>;
 }
 function OutputCard({number,title,icon,children}) { return <section className="output-card"><div className="output-head"><span className="output-number">{number}</span><span className="output-icon">{icon}</span><h3>{title}</h3></div>{children}</section> }
