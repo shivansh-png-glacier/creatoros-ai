@@ -7,7 +7,7 @@ CreatorOS AI is a creator workspace for turning a single content idea into a str
 > **Demo video:** paste the link to the edited 2:08 demo cut here (unlisted YouTube / Drive) before submitting. The edited cut was made from your original 4:40 recording — overlays added, slow typing and thumbnail editing fast-forwarded.
 > **Live demo:** paste the deployed PR #3 link here — use the production link, not a Vercel preview link.
 
-![CreatorOS AI demo with overlay](screenshots/00-demo-overlay.png)
+![CreatorOS AI demo with overlay][(screenshots/00-demo-overlay.png)](https://drive.google.com/file/d/1nxYa3pBthc5SbVA-bTZTJvHo92AAkvvB/view?usp=drive_link)
 
 ![CreatorOS AI home](screenshots/01-home.png)
 
