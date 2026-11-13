@@ -5,8 +5,35 @@ import cors from 'cors';
 import sharp from 'sharp';
 
 const app = express();
+// Behind Render/Vercel the real client IP arrives in X-Forwarded-For.
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '40kb' }));
+
+// Basic per-IP rate limiting for the AI endpoints, so one visitor can't
+// burn through the Meta API credits. 30 AI requests per IP per hour.
+const AI_RATE_LIMIT = 30;
+const AI_RATE_WINDOW_MS = 60 * 60 * 1000;
+const aiRequestCounts = new Map();
+
+function aiRateLimit(req, res, next) {
+  const now = Date.now();
+  const entry = aiRequestCounts.get(req.ip) || { count: 0, resetAt: now + AI_RATE_WINDOW_MS };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + AI_RATE_WINDOW_MS;
+  }
+  entry.count += 1;
+  aiRequestCounts.set(req.ip, entry);
+  if (entry.count > AI_RATE_LIMIT) {
+    const retryAfterSeconds = Math.ceil((entry.resetAt - now) / 1000);
+    res.set('Retry-After', String(retryAfterSeconds));
+    return res.status(429).json({
+      error: 'Too many requests. Please wait a little and try again.'
+    });
+  }
+  next();
+}
 
 const port = Number(process.env.PORT || 8787);
 const apiKey = process.env.MODEL_API_KEY;
@@ -54,7 +81,7 @@ app.get('/api/health', (_req, res) => {
 const clean = (value, max = 500) =>
   typeof value === 'string' ? value.trim().slice(0, max) : '';
 
-app.post('/api/generate', async (req, res) => {
+app.post('/api/generate', aiRateLimit, async (req, res) => {
   console.log('Received /api/generate request');
 
   const topic = clean(req.body?.topic, 500);
@@ -263,7 +290,7 @@ All content must belong to the same campaign. Do not add extra fields.`,
 });
 
 
-app.post('/api/generate-thumbnail', async (req, res) => {
+app.post('/api/generate-thumbnail', aiRateLimit, async (req, res) => {
   const topic = clean(req.body?.topic, 500);
   const platform = clean(req.body?.platform, 40) || 'YouTube';
   const thumbnailText = clean(req.body?.thumbnail, 80);
