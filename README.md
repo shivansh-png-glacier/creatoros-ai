@@ -4,10 +4,10 @@
 
 CreatorOS AI is a creator workspace for turning a single content idea into a structured campaign. Type an idea, choose the platform, audience and goal, and it generates a campaign you can review, edit and export as a PDF brief.
 
-> **Demo video:** paste the link to the edited 2:08 demo cut here (unlisted YouTube / Drive) before submitting. The edited cut was made from your original 4:40 recording — overlays added, slow typing and thumbnail editing fast-forwarded.
-> **Live demo:** paste the deployed PR #3 link here — use the production link, not a Vercel preview link.
+> **Demo video:** [Watch the 2:08 demo](https://drive.google.com/file/d/1nxYa3pBthc5SbVA-bTZTJvHo92AAkvvB/view?usp=drive_link) (edited cut from the original 4:40 recording — overlays added, slow typing and thumbnail editing fast-forwarded).
+> **Live demo:** [creatoros-ai-mu.vercel.app](https://creatoros-ai-mu.vercel.app)
 
-![CreatorOS AI demo with overlay][(screenshots/00-demo-overlay.png)](https://drive.google.com/file/d/1nxYa3pBthc5SbVA-bTZTJvHo92AAkvvB/view?usp=drive_link)
+[![CreatorOS AI demo with overlay](screenshots/00-demo-overlay.png)](https://drive.google.com/file/d/1nxYa3pBthc5SbVA-bTZTJvHo92AAkvvB/view?usp=drive_link)
 
 ![CreatorOS AI home](screenshots/01-home.png)
 
@@ -59,8 +59,10 @@ Work built during the event:
 
 - **Frontend:** React 18 + Vite
 - **Backend:** Node.js + Express (`server/index.js`)
+- **AI:** Meta Model API — Muse Spark (`muse-spark-1.3`) for campaigns, Muse Image (`muse-image-1.0`) for thumbnails
+- **Auth & storage:** Supabase (sign-in, saved campaigns)
 - **UI:** Custom CSS design system, Lucide icons
-- **Images:** Sharp is included as a dependency for image handling
+- **Images:** Sharp for thumbnail resizing per platform
 
 ## Run locally
 
@@ -68,7 +70,7 @@ Work built during the event:
 
 - Node.js 20 or newer
 - npm
-- An API key for real AI generation (see `.env.example`)
+- A Meta Model API key for real AI generation, plus Supabase project credentials (see `.env.example`)
 
 ### Steps
 
@@ -106,10 +108,9 @@ vite.config.js     # Vite config and local API proxy
 
 ## What is not yet built
 
-- User accounts and cloud sync — campaigns are saved in the browser / current workspace
 - Publishing directly to social networks
 - Analytics from real platform APIs
-- Production rate limiting and abuse protection
+- Per-account usage limits (the API currently has a basic per-IP rate limit)
 
 A working demo is a starting point, not proof of product-market fit. Do not claim user growth or business results until measured.
 
